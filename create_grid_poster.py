@@ -37,6 +37,7 @@ from common import (
     slugify,
 )
 from osm_data import (
+    fetch_lines_and_plants,
     fetch_power_features,
     fetch_power_features_single,
     fetch_power_plants,
@@ -276,18 +277,30 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument(
         "--tile-delay",
         type=float,
-        default=30,
-        help="Seconds to wait between Overpass tile API requests (default: 30). "
-             "Useful to avoid rate-limiting on busy public endpoints.",
+        default=0,
+        help="Minimum seconds between Overpass tile API requests. Defaults to 0: "
+             "the downloader already widens this automatically when the server "
+             "throttles it, so a fixed delay only slows down runs that were never "
+             "being rate-limited. Set a value to pace requests from the start.",
+    )
+    parser.add_argument(
+        "--tile-workers",
+        type=int,
+        default=2,
+        help="Number of tiles to download concurrently. Public Overpass endpoints "
+             "allow only a couple of simultaneous slots per client, so raising this "
+             "much above the default tends to trigger rate-limiting instead of "
+             "going faster. Use 1 to download strictly one tile at a time.",
     )
     parser.add_argument("--verbose-osmnx", action="store_true", help="Print OSMnx request logs")
     parser.add_argument(
         "--overpass-endpoint",
         help="Override the Overpass API endpoint. Use a mirror when the default "
              "(overpass-api.de) is rate-limiting or refusing connections. "
-             "Examples: https://overpass.kumi.systems/api/interpreter, "
-             "https://overpass.private.coffee/api/interpreter, "
-             "https://overpass.osm.ch/api/interpreter.",
+             "Examples: https://overpass.private.coffee/api/interpreter, "
+             "https://overpass.kumi.systems/api/interpreter. Avoid regional "
+             "instances such as overpass.osm.ch, which only hold data for their "
+             "own country and will silently return almost nothing elsewhere.",
     )
     parser.add_argument(
         "--no-cache",
@@ -330,7 +343,11 @@ def main(argv: Iterable[str] = sys.argv[1:]) -> int:
 
     ox.settings.use_cache = not args.no_cache
     ox.settings.log_console = bool(args.verbose_osmnx)
-    ox.settings.requests_timeout = 180
+    # A large tile on a busy mirror routinely needs more than a couple of
+    # minutes of server time. Timing out early wastes both the wait and the
+    # work Overpass already did, and the retry starts from scratch - so allow
+    # a slow query to finish rather than re-queueing it.
+    ox.settings.requests_timeout = 300
     if args.overpass_endpoint:
         ox.settings.overpass_url = args.overpass_endpoint
         print(f"Using Overpass endpoint: {args.overpass_endpoint}")
@@ -368,6 +385,7 @@ def main(argv: Iterable[str] = sys.argv[1:]) -> int:
             use_cache=not args.no_cache,
         )
     cable_buffer_km = args.cable_sea_buffer_km if args.include_cables else 0.0
+    raw_plants = None
     if args.single_query:
         raw_lines = fetch_power_features_single(
             country=args.country,
@@ -377,6 +395,21 @@ def main(argv: Iterable[str] = sys.argv[1:]) -> int:
             sea_buffer_km=cable_buffer_km,
             render_crs=args.crs,
             use_cache=not args.no_cache,
+        )
+    elif args.show_plants:
+        # Lines and plants share the same tile grid, so fetch them in one pass
+        # instead of walking it twice - halves the Overpass requests.
+        raw_lines, raw_plants = fetch_lines_and_plants(
+            country=args.country,
+            boundary=boundary_wgs84,
+            include_minor_lines=args.include_minor_lines,
+            include_cables=args.include_cables,
+            tile_size_km=args.tile_size_km,
+            render_crs=args.crs,
+            sea_buffer_km=cable_buffer_km,
+            use_cache=not args.no_cache,
+            tile_delay=args.tile_delay,
+            workers=args.tile_workers,
         )
     else:
         raw_lines = fetch_power_features(
@@ -389,6 +422,7 @@ def main(argv: Iterable[str] = sys.argv[1:]) -> int:
             sea_buffer_km=cable_buffer_km,
             use_cache=not args.no_cache,
             tile_delay=args.tile_delay,
+            workers=args.tile_workers,
         )
 
     boundary_projected = boundary_wgs84.to_crs(args.crs)
@@ -398,14 +432,17 @@ def main(argv: Iterable[str] = sys.argv[1:]) -> int:
 
     plants_projected = None
     if args.show_plants:
-        raw_plants = fetch_power_plants(
-            country=args.country,
-            boundary=boundary_wgs84,
-            tile_size_km=args.tile_size_km,
-            render_crs=args.crs,
-            use_cache=not args.no_cache,
-            tile_delay=args.tile_delay,
-        )
+        if raw_plants is None:
+            # --single-query fetches lines only, so plants still need their own pass.
+            raw_plants = fetch_power_plants(
+                country=args.country,
+                boundary=boundary_wgs84,
+                tile_size_km=args.tile_size_km,
+                render_crs=args.crs,
+                use_cache=not args.no_cache,
+                tile_delay=args.tile_delay,
+                workers=args.tile_workers,
+            )
         plants_projected = prepare_plants(
             raw_plants, boundary_wgs84, args.crs, min_capacity_mw=args.min_plant_capacity
         )

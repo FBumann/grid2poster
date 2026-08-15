@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
 
@@ -376,6 +378,111 @@ _TILE_ID_COLS = ["element", "element_type", "osmid", "id"]
 _LINE_COLS = ["power", "voltage", "name", "operator", "geometry"]
 _PLANT_COLS = ["power", "plant:source", "plant:output:electricity", "name", "operator", "geometry"]
 
+_LINE_GEOM_TYPES = ["LineString", "MultiLineString"]
+_PLANT_GEOM_TYPES = ["Point", "Polygon", "MultiPolygon"]
+
+# Substrings marking a failure as "the server is throttling us" rather than a
+# genuine error, so the tile loop backs off instead of retrying at full speed.
+# Overpass enforces its per-IP slot quota by refusing the TCP connection
+# outright, which surfaces as ECONNREFUSED - errno 111 on Linux but 61 on
+# macOS/BSD, so match the message text rather than either number.
+_RATE_LIMIT_MARKERS = (
+    "connection refused",
+    "connection reset",
+    "too many requests",
+    "rate limit",
+    "429",
+    "503",
+    "504",
+    "slot available",
+)
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in _RATE_LIMIT_MARKERS)
+
+
+class _RateGate:
+    """Shared request pacing for concurrent tile workers.
+
+    Holds the minimum spacing between Overpass requests. Every worker passes
+    through ``wait`` before issuing a request, so the spacing is enforced
+    across threads rather than per thread. A rate-limit failure doubles the
+    spacing (``penalize``); each success decays it back toward the caller's
+    baseline (``relax``), so a run that trips the quota once slows down
+    briefly instead of for its whole remaining duration.
+    """
+
+    def __init__(self, base_delay: float, max_delay: float = 120.0) -> None:
+        self._lock = threading.Lock()
+        self._base = max(0.0, base_delay)
+        self._max = max_delay
+        self._delay = self._base
+        self._next_at = 0.0
+
+    def wait(self) -> None:
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                if now >= self._next_at:
+                    self._next_at = now + self._delay
+                    return
+                sleep_for = self._next_at - now
+            time.sleep(sleep_for)
+
+    def penalize(self) -> float:
+        """Double the spacing after a throttling failure; returns the new value."""
+        with self._lock:
+            self._delay = min(self._max, max(self._delay * 2, 5.0))
+            self._next_at = time.monotonic() + self._delay
+            return self._delay
+
+    def relax(self) -> None:
+        with self._lock:
+            self._delay = max(self._base, self._delay / 2)
+
+    @property
+    def delay(self) -> float:
+        with self._lock:
+            return self._delay
+
+
+def _ring_coord_count(geometry: Any) -> int:
+    if isinstance(geometry, Polygon):
+        return len(geometry.exterior.coords)
+    if isinstance(geometry, MultiPolygon):
+        return sum(len(p.exterior.coords) for p in geometry.geoms)
+    return 0
+
+
+# Vertex budget above which a tile outline is simplified before querying.
+# OSMnx serializes every vertex of the query polygon into the request body
+# without simplifying it, so a tile clipped to a detailed coastline can carry
+# tens of thousands of coordinate pairs - Germany's worst 400 km tile is
+# 38,482 of them, a 766 KB request body per tile.
+_MAX_TILE_QUERY_COORDS = 500
+
+
+def _query_footprint(tile_geom: Any) -> Any:
+    """Return the polygon actually sent to Overpass for ``tile_geom``.
+
+    Simplify the outline until it fits the vertex budget, buffering by the
+    simplification tolerance so the result still contains the whole tile - a
+    footprint that covers the tile can only fetch extra features, never miss
+    one, and the extras are discarded later when prepare_lines clips to the
+    boundary. The bounding box is the last resort: it collapses to four
+    corners but, on a 800 km tile along a border, drags in ~39% more area
+    (measured on Germany) worth of neighbouring countries' grid.
+    """
+    if _ring_coord_count(tile_geom) <= _MAX_TILE_QUERY_COORDS:
+        return tile_geom
+    for tolerance in (0.001, 0.002, 0.005, 0.01, 0.02, 0.05):
+        candidate = tile_geom.simplify(tolerance).buffer(tolerance * 2, join_style=2)
+        if _ring_coord_count(candidate) <= _MAX_TILE_QUERY_COORDS and candidate.covers(tile_geom):
+            return candidate
+    return tile_geom.envelope
+
 
 def _fetch_tiles(
     tiles: gpd.GeoDataFrame,
@@ -385,6 +492,7 @@ def _fetch_tiles(
     keep_cols: list[str],
     use_cache: bool,
     tile_delay: float,
+    workers: int = 2,
 ) -> list[gpd.GeoDataFrame]:
     """Download ``tags`` features for every tile, returning one frame per tile.
 
@@ -392,33 +500,39 @@ def _fetch_tiles(
     caching, adaptive rate-limit backoff, and indefinite retries for failed
     tiles. Only features whose geometry type is in ``geometry_types`` are kept,
     trimmed to ``keep_cols``.
+
+    Tiles are fetched concurrently by ``workers`` threads. Overpass allows a
+    small number of simultaneous slots per client, so the default stays low;
+    the shared _RateGate spaces requests and widens that spacing whenever the
+    server throttles us.
     """
     frames: list[gpd.GeoDataFrame] = []
+    frames_lock = threading.Lock()
     empty_tile = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
-    rate_limit_delay = tile_delay
+    gate = _RateGate(tile_delay)
 
     def process_tile(tile_number: int, tile_geom, total: int) -> bool:
         """Fetch a tile's features and append to ``frames``. Returns True on success."""
-        nonlocal rate_limit_delay
-        if rate_limit_delay > 0:
-            label = "Tile delay" if rate_limit_delay <= tile_delay else "Rate-limit backoff"
-            print(f"  {label}: waiting {rate_limit_delay}s before next request")
-            time.sleep(rate_limit_delay)
+        gate.wait()
         try:
-            features = ox.features_from_polygon(tile_geom, tags=tags)
+            features = ox.features_from_polygon(_query_footprint(tile_geom), tags=tags)
         except Exception as exc:
             # OSMnx raises this when Overpass returned a valid response with zero
             # matching features — not a server error, so cache as empty and move on.
             if "No matching features" in str(exc):
                 cache_set(tile_cache_key(tile_geom), empty_tile)
-                rate_limit_delay = max(tile_delay, rate_limit_delay - 5)
+                gate.relax()
                 return True
-            is_rate_limit = "111" in str(exc) or "rate" in str(exc).lower() or "too many" in str(exc).lower()
-            if is_rate_limit:
-                rate_limit_delay = min(120, rate_limit_delay + 10)
-            print(f"  Warning: tile {tile_number:,}/{total:,} failed: {exc}")
+            if _is_rate_limited(exc):
+                delay = gate.penalize()
+                print(
+                    f"  Tile {tile_number:,}/{total:,} throttled by the server; "
+                    f"spacing requests {delay:.0f}s apart"
+                )
+            else:
+                print(f"  Warning: tile {tile_number:,}/{total:,} failed: {exc}")
             return False
-        rate_limit_delay = max(tile_delay, rate_limit_delay - 5)
+        gate.relax()
 
         if features.empty:
             cache_set(tile_cache_key(tile_geom), empty_tile)
@@ -433,7 +547,8 @@ def _fetch_tiles(
         cols = [col for col in keep_cols if col in matching.columns]
         tile_gdf = gpd.GeoDataFrame(matching[cols], geometry="geometry", crs="EPSG:4326")
         cache_set(tile_cache_key(tile_geom), tile_gdf)
-        frames.append(tile_gdf)
+        with frames_lock:
+            frames.append(tile_gdf)
         return True
 
     total_tiles = len(tiles)
@@ -452,25 +567,35 @@ def _fetch_tiles(
     if cached_hits:
         print(f"  Reused {cached_hits:,}/{total_tiles:,} tile(s) from per-tile cache")
 
-    pending: list[tuple[int, Any]] = []
-    for tile_number, tile_geom in uncached:
-        print(f"  Tile {tile_number:,}/{total_tiles:,}")
-        if not process_tile(tile_number, tile_geom, total_tiles):
-            pending.append((tile_number, tile_geom))
+    def run_round(batch: list[tuple[int, Any]], label: str) -> list[tuple[int, Any]]:
+        """Fetch every tile in ``batch`` concurrently; return the ones that failed."""
+        failed: list[tuple[int, Any]] = []
+        done = 0
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            futures = {
+                pool.submit(process_tile, number, geom, total_tiles): (number, geom)
+                for number, geom in batch
+            }
+            for future in as_completed(futures):
+                item = futures[future]
+                done += 1
+                if future.result():
+                    print(f"  {label} {item[0]:,}/{total_tiles:,} ok ({done:,}/{len(batch):,})")
+                else:
+                    failed.append(item)
+        return failed
+
+    pending = run_round(uncached, "Tile")
 
     attempt = 1
     while pending:
-        delay = min(300, max(rate_limit_delay, 10 * attempt))
+        delay = min(300, max(gate.delay, 10 * attempt))
         print(
-            f"Retrying {len(pending):,} failed tile(s) in {delay}s "
+            f"Retrying {len(pending):,} failed tile(s) in {delay:.0f}s "
             f"(attempt {attempt + 1})..."
         )
         time.sleep(delay)
-        next_pending: list[tuple[int, Any]] = []
-        for tile_number, tile_geom in pending:
-            print(f"  Retry tile {tile_number:,}/{total_tiles:,}")
-            if not process_tile(tile_number, tile_geom, total_tiles):
-                next_pending.append((tile_number, tile_geom))
+        next_pending = run_round(pending, "Retry tile")
 
         if next_pending and len(next_pending) == len(pending):
             print(
@@ -505,6 +630,7 @@ def fetch_power_features(
     sea_buffer_km: float = 0.0,
     use_cache: bool = True,
     tile_delay: float = 0,
+    workers: int = 2,
 ) -> gpd.GeoDataFrame:
     values = power_tag_values(include_minor_lines, include_cables)
     key = cache_key("power_features", country, values, tile_size_km, render_crs, sea_buffer_km)
@@ -532,10 +658,11 @@ def fetch_power_features(
         tiles,
         tags={"power": values},
         tile_cache_key=tile_cache_key,
-        geometry_types=["LineString", "MultiLineString"],
+        geometry_types=_LINE_GEOM_TYPES,
         keep_cols=_TILE_ID_COLS + _LINE_COLS,
         use_cache=use_cache,
         tile_delay=tile_delay,
+        workers=workers,
     )
 
     if not frames:
@@ -556,6 +683,7 @@ def fetch_power_plants(
     render_crs: str = "EPSG:8857",
     use_cache: bool = True,
     tile_delay: float = 0,
+    workers: int = 2,
 ) -> gpd.GeoDataFrame:
     """Fetch power=plant features inside the boundary, tiled like the lines.
 
@@ -582,10 +710,11 @@ def fetch_power_plants(
         tiles,
         tags={"power": "plant"},
         tile_cache_key=tile_cache_key,
-        geometry_types=["Point", "Polygon", "MultiPolygon"],
+        geometry_types=_PLANT_GEOM_TYPES,
         keep_cols=_TILE_ID_COLS + _PLANT_COLS,
         use_cache=use_cache,
         tile_delay=tile_delay,
+        workers=workers,
     )
 
     if not frames:
@@ -597,3 +726,107 @@ def fetch_power_plants(
     combined = _combine_tile_frames(frames, _PLANT_COLS)
     cache_set(key, combined)
     return combined
+
+
+def fetch_lines_and_plants(
+    country: str,
+    boundary: gpd.GeoDataFrame,
+    include_minor_lines: bool = False,
+    include_cables: bool = False,
+    tile_size_km: float = 200,
+    render_crs: str = "EPSG:8857",
+    sea_buffer_km: float = 0.0,
+    use_cache: bool = True,
+    tile_delay: float = 0,
+    workers: int = 2,
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    """Fetch power lines and power plants in a single tiled pass.
+
+    Calling fetch_power_features and fetch_power_plants separately walks the
+    same tile grid twice and so issues twice the Overpass requests - the
+    binding cost on a rate-limited public endpoint. One query per tile asking
+    for lines and plants together halves that, at no extra server cost since
+    both are ``power=*`` matches over the same area.
+    """
+    values = power_tag_values(include_minor_lines, include_cables)
+    tag_values = values + ["plant"]
+    lines_key = cache_key(
+        "power_features_combined_v1", country, tag_values, tile_size_km, render_crs, sea_buffer_km
+    )
+    plants_key = cache_key(
+        "power_plants_combined_v1", country, tag_values, tile_size_km, render_crs, sea_buffer_km
+    )
+    if use_cache:
+        cached_lines = cache_get(lines_key)
+        cached_plants = cache_get(plants_key)
+        if cached_lines is not None and cached_plants is not None:
+            print(f"Using cached power features and plants for {country}")
+            return cached_lines, cached_plants
+
+    tiles = make_query_tiles(
+        boundary,
+        tile_size_km=tile_size_km,
+        render_crs=render_crs,
+        sea_buffer_km=sea_buffer_km,
+    )
+    print(
+        f"Downloading OSM power features: power={tag_values} across {len(tiles):,} tiles"
+    )
+
+    def tile_cache_key(tile_geom: Any) -> str:
+        return cache_key("power_combined_tile_v1", country, tag_values, tile_geom.wkb_hex)
+
+    frames = _fetch_tiles(
+        tiles,
+        tags={"power": tag_values},
+        tile_cache_key=tile_cache_key,
+        geometry_types=_LINE_GEOM_TYPES + _PLANT_GEOM_TYPES,
+        keep_cols=_TILE_ID_COLS + sorted(set(_LINE_COLS + _PLANT_COLS)),
+        use_cache=use_cache,
+        tile_delay=tile_delay,
+        workers=workers,
+    )
+
+    if not frames:
+        raise RuntimeError(
+            f"No geometries found for power={tag_values} in {country}. "
+            "Try a smaller --tile-size-km or rerun later if Overpass is busy."
+        )
+
+    combined = gpd.GeoDataFrame(
+        pd.concat(frames, ignore_index=True), geometry="geometry", crs="EPSG:4326"
+    )
+    id_cols = [col for col in _TILE_ID_COLS if col in combined.columns]
+    combined = combined.drop_duplicates(subset=id_cols or ["geometry"])
+
+    # Split on the power tag rather than geometry alone: a plant mapped as a
+    # closed way is a Polygon, but so is nothing among the line values, and a
+    # plant is never a LineString. Geometry type then filters out the leftovers
+    # each side cannot render (e.g. a line's stray Point node).
+    is_plant = combined["power"] == "plant" if "power" in combined.columns else None
+    if is_plant is None:
+        raise RuntimeError("Overpass response is missing the 'power' tag column")
+
+    lines = combined[~is_plant & combined.geometry.type.isin(_LINE_GEOM_TYPES)]
+    plants = combined[is_plant & combined.geometry.type.isin(_PLANT_GEOM_TYPES)]
+
+    lines = gpd.GeoDataFrame(
+        lines[[c for c in _LINE_COLS if c in lines.columns]],
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    plants = gpd.GeoDataFrame(
+        plants[[c for c in _PLANT_COLS if c in plants.columns]],
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+
+    if lines.empty:
+        raise RuntimeError(
+            f"No line geometries found for power={values} in {country}. "
+            "Try a smaller --tile-size-km or rerun later if Overpass is busy."
+        )
+
+    cache_set(lines_key, lines)
+    cache_set(plants_key, plants)
+    return lines, plants

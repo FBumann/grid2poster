@@ -46,11 +46,13 @@ pip install -r requirements.txt
 
 ## Usage
 
-To create a poster for a country, state or province, use the --country option to resolve the boundaries via [Nominatim](https://nominatim.org/). Setting a large '--tile-size-km' in kilometres and '--tile-delay' in seconds reduces the timeout of the Overpass server. By default, every run creates both a PNG and an SVG file.
+To create a poster for a country, state or province, use the --country option to resolve the boundaries via [Nominatim](https://nominatim.org/). A large '--tile-size-km' in kilometres means fewer, bigger Overpass queries, which is usually the best lever against a busy server. By default, every run creates both a PNG and an SVG file.
+
+Tiles are downloaded a few at a time ('--tile-workers', default 2) and the downloader spaces requests out on its own whenever Overpass starts throttling it, so you should not need '--tile-delay' unless you want to pace requests from the very first tile.
 
 By default posters print at **A3 portrait (297 × 420 mm) at 300 DPI**. Use `--paper-size` for another named preset, `--width`/`--height` for custom millimeter dimensions, and `--landscape` to flip orientation.
 ```bash
-python create_grid_poster.py --country Brazil --tile-delay 30 --tile-size-km 500
+python create_grid_poster.py --country Brazil --tile-size-km 500
 ```
 Depending on the size of the country and whether distribution grids are excluded, loading the data via a single query (--single-query) is much faster. For large countries with lots of distribution grids, the data should be loaded in multiple tiles:
 ```bash
@@ -99,13 +101,13 @@ Continent-scale runs hit the Overpass API hundreds of times and can take several
 
 ### Global posters and atlas themes
 
-`--country Global` renders the whole inhabited world as the union of the continents, clipped to a tight bounding box so it fills the page. It is the longest job in the tool (many hundreds of Overpass queries, several hours), so use a large `--tile-size-km`, a generous `--tile-delay`, and high `--voltage-tiers` so HV/EHV lines stand out at world scale. The `themes/` directory ships three palettes tuned for this scale: `global_grid_atlas` (dark atlas), `global_grid_atlas_neon` (neon), and `global_paper_grid_atlas` (warm paper).
+`--country Global` renders the whole inhabited world as the union of the continents, clipped to a tight bounding box so it fills the page. It is the longest job in the tool (many hundreds of Overpass queries, several hours), so use a large `--tile-size-km` and high `--voltage-tiers` so HV/EHV lines stand out at world scale. The `themes/` directory ships three palettes tuned for this scale: `global_grid_atlas` (dark atlas), `global_grid_atlas_neon` (neon), and `global_paper_grid_atlas` (warm paper).
 
 ```bash
 python create_grid_poster.py --country Global \
   --display-country "The Global Electrical Transmission Grid" --subtitle "Electrify Everything" \
   --theme global_grid_atlas_neon --landscape --paper-size a0 \
-  --tile-size-km 1000 --tile-delay 30 --voltage-tiers 110,220,400,765 --padding -0.1
+  --tile-size-km 1000 --voltage-tiers 110,220,400,765 --padding -0.1
 ```
 
 <p align="center">
@@ -125,13 +127,13 @@ Most options can be combined in a single run. The command below renders the cont
 ```bash
 python3 create_grid_poster.py --country "Europe" --boundary-geojson ./regions/europe.geojson \
   --tile-size-km 800 --include-cables --include-minor-lines --theme monochrome_density \
-  --tile-delay 30 --landscape --shift-y 0.18 --padding -0.35 --no-cache --cable-sea-buffer-km 500
+  --landscape --shift-y 0.18 --padding -0.35 --no-cache --cable-sea-buffer-km 500
 ```
 
 What each flag contributes:
 
 - `--boundary-geojson ./regions/europe.geojson` - use the predefined 37-unit Europe boundary instead of geocoding.
-- `--tile-size-km 800` with `--tile-delay 30` - fewer, larger Overpass tiles spaced 30 s apart to stay under per-query limits without tripping rate limits.
+- `--tile-size-km 800` - fewer, larger Overpass tiles, to stay under per-query limits with as few requests as possible.
 - `--include-minor-lines` / `--include-cables` - add `power=minor_line` and `power=cable` features on top of the transmission lines.
 - `--cable-sea-buffer-km 500` - inflate the boundary 500 km over water so long submarine cables survive coastline clipping.
 - `--theme monochrome_density` / `--landscape` - black-on-cream density styling in horizontal orientation.
@@ -182,7 +184,8 @@ What each flag contributes:
 | `--logo-margin` | `12.0` | Margin in millimeters between the logo and the lower-left poster edges. |
 | `--logo-alpha` | `1.0` | Logo opacity, from `0` (transparent) to `1` (fully opaque). |
 | `--single-query` | off | Fetch all power features in a single Overpass query instead of tiling. Faster for small/medium regions but may time out on large countries or continents. |
-| `--tile-delay` | `30` | Seconds to wait between Overpass tile API requests. Useful to avoid rate-limiting on busy public endpoints. |
+| `--tile-delay` | `0` | Minimum seconds between Overpass tile API requests. The downloader widens this automatically when the server throttles it, so a fixed delay only slows down runs that were never being rate-limited. Set a value to pace requests from the start. |
+| `--tile-workers` | `2` | Number of tiles to download concurrently. Public Overpass endpoints allow only a couple of simultaneous slots per client, so raising this much higher tends to trigger rate-limiting instead of going faster. Use `1` for strictly one tile at a time. |
 | `--export-geojson` | off | Also save all transmission lines as a single GeoJSON in WGS84 (EPSG:4326). Pass a path to override the default location in `posters/`. |
 | `--no-cache` | off | Ignore cached boundaries and OSM power features on this run. Fresh results are still written to the cache for future runs. |
 | `--verbose-osmnx` | off | Print OSMnx request logs. |
