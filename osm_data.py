@@ -762,10 +762,10 @@ def fetch_lines_and_plants(
     values = power_tag_values(include_minor_lines, include_cables)
     tag_values = values + ["plant"]
     lines_key = cache_key(
-        "power_features_combined_v1", country, tag_values, tile_size_km, render_crs, sea_buffer_km
+        "power_features_combined_v1", _cache_name(country), tag_values, tile_size_km, render_crs, sea_buffer_km
     )
     plants_key = cache_key(
-        "power_plants_combined_v1", country, tag_values, tile_size_km, render_crs, sea_buffer_km
+        "power_plants_combined_v1", _cache_name(country), tag_values, tile_size_km, render_crs, sea_buffer_km
     )
     if use_cache:
         cached_lines = cache_get(lines_key)
@@ -785,7 +785,7 @@ def fetch_lines_and_plants(
     )
 
     def tile_cache_key(tile_geom: Any) -> str:
-        return cache_key("power_combined_tile_v1", country, tag_values, tile_geom.wkb_hex)
+        return cache_key("power_combined_tile_v1", _cache_name(country), tag_values, tile_geom.wkb_hex)
 
     frames = _fetch_tiles(
         tiles,
